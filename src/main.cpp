@@ -1,35 +1,146 @@
-#include <Arduino.h>
-#include <WiFi.h>
-#include <HTTPClient.h>
-#include <Arduino_JSON.h>
-#include <TinyGPS++.h>
+#define TINY_GSM_MODEM_SIM808
 
-// Choose two ESP32 pins to use for hardware serial
-int RXPin = 16;  // This is the default RX2 pin on ESP32
-int TXPin = 17;  // This is the default TX2 pin on ESP32
 
-int GPSBaud = 9600;
+// Set serial for debug console (to the Serial Monitor, default speed 115200)
+#define SerialMon Serial
+// #define TINY_GSM_DEBUG SerialMon
+HardwareSerial SerialAT(2);  
 
-// Create a TinyGPS++ object
-TinyGPSPlus gps;
+#if !defined(TINY_GSM_RX_BUFFER)
+#define TINY_GSM_RX_BUFFER 650
+#endif
 
-const char* ssid = "Galaxy M624912";
-const char* password = "farid782";
+// Define the serial console for debug prints, if needed
+//  #define TINY_GSM_DEBUG SerialMon
 
-const String url = "https://maps.googleapis.com/maps/api/directions/json?";
-const String origin="-7.282058008443928,112.79494675412441";
-const String destination="-7.288465791966643,112.80169150994796";
-const String key="AIzaSyCu7ZP3tACUVSbS_tHCHfD3Ix76BRwz4IQ";
-const char* serverName="https://maps.googleapis.com/maps/api/directions/json?origin=-7.282058008443928,112.79494675412441&destination=-7.288465791966643,112.80169150994796&mode=walking&key=AIzaSyCu7ZP3tACUVSbS_tHCHfD3Ix76BRwz4IQ";
-unsigned long lastTime = 0;
-unsigned long timerDelay = 5000;
+// set GSM PIN, if any
+#define GSM_PIN ""
 
-// LED pin number (replace with your actual GPIO pin number)
-const int ledPin = 2;
+// flag to force SSL client authentication, if needed
+//#define TINY_GSM_SSL_CLIENT_AUTHENTICATION
 
-// Task handles
-TaskHandle_t httpTaskHandle = NULL;
-TaskHandle_t gpsTaskHandle = NULL;
+// Your GPRS credentials, if any
+const char apn[]      = "YourAPN";
+const char gprsUser[] = "";
+const char gprsPass[] = "";
+
+// Server details
+
+const char server[]   = "maps.googleapis.com";
+// const char resource[] = "/maps/api/directions/json?origin=-7.282058008443928,112.79494675412441&destination=-7.288465791966643,112.80169150994796&mode=walking&key=AIzaSyCu7ZP3tACUVSbS_tHCHfD3Ix76BRwz4IQ";
+const int  port       = 443;
+float OriginLatitude=-7.282058, OriginLongitude=112.7949467, DestinationLatitude=-7.288465, DestinationLongitude=112.8016915;
+
+// Function to create the resource string
+String createResourceString(float originLat, float originLon, float destLat, float destLon) {
+  // Define the base part of the URL
+  const char* baseUrl = "/maps/api/directions/json?";
+  const char* apiKey = "&mode=walking&key=AIzaSyCu7ZP3tACUVSbS_tHCHfD3Ix76BRwz4IQ";
+
+  // Buffer to hold the final string
+  char resource[256]; // Adjust the size as needed
+
+  // Format the string
+  sprintf(resource, "%sorigin=%f,%f&destination=%f,%f%s", baseUrl, originLat, originLon, destLat, destLon, apiKey);
+
+  // Convert char array to String for ease of use
+  return String(resource);
+}
+#include <TinyGsmClient.h>
+#include <HttpClient.h>
+
+TinyGsm        modem(SerialAT);
+TinyGsmClientSecure client(modem);
+HttpClient          http(client, server, port);
+
+TaskHandle_t Task1;
+TaskHandle_t GPStask;
+TaskHandle_t GmapsGettask;
+// LED pins
+const int led = LED_BUILTIN;
+
+void setup() {
+  // Set console baud rate
+  SerialMon.begin(115200);
+  delay(10);
+  pinMode(led, OUTPUT);
+
+
+
+  // !!!!!!!!!!!
+  // Set your reset, enable, power pins here
+  // !!!!!!!!!!!
+
+  SerialMon.println("Wait...");
+
+  // Set GSM module baud rate
+  // TinyGsmAutoBaud(SerialAT, GSM_AUTOBAUD_MIN, GSM_AUTOBAUD_MAX);
+  SerialAT.begin(57600);
+  delay(6000); 
+
+  // Restart takes quite some time
+  // To skip it, call init() instead of restart()
+  SerialMon.println("Initializing modem...");
+  modem.init();
+    //create a task that will be executed in the Task1code() function, with priority 1 and executed on core 0
+  xTaskCreatePinnedToCore(
+                    Task1code,   /* Task function. */
+                    "Task1",     /* name of task. */
+                    10000,       /* Stack size of task */
+                    NULL,        /* parameter of the task */
+                    1,           /* priority of the task */
+                    &Task1,      /* Task handle to keep track of created task */
+                    0);          /* pin task to core 0 */                  
+  delay(500); 
+
+  //create a task that will be executed in the Task1code() function, with priority 1 and executed on core 0
+  xTaskCreatePinnedToCore(
+                    GPSTask,   /* Task function. */
+                    "GPS Task",     /* name of task. */
+                    10000,       /* Stack size of task */
+                    NULL,        /* parameter of the task */
+                    0,           /* priority of the task */
+                    &GPStask,      /* Task handle to keep track of created task */
+                    0);          /* pin task to core 0 */                  
+  delay(500); 
+  
+  if (GSM_PIN && modem.getSimStatus() != 3) { modem.simUnlock(GSM_PIN); }
+}
+
+void loop() {
+  if (!modem.gprsConnect(apn, gprsUser, gprsPass)) {
+    SerialMon.println(" fail");
+    vTaskDelay(5*1000/portTICK_RATE_MS);
+    return;
+  }
+
+  SerialMon.print(F("Performing HTTPS GET request... "));
+  http.connectionKeepAlive();  // Currently, this is needed for HTTPS
+  int err = http.get(createResourceString(OriginLatitude, OriginLongitude, DestinationLatitude, DestinationLongitude));
+  if (err != 0) {
+    SerialMon.println(F("failed to connect"));
+    SerialMon.println(err);
+    modem.restart();
+    vTaskDelay(5*1000/portTICK_RATE_MS);
+    return;
+  }
+
+  int status = http.responseStatusCode();
+  SerialMon.print(F("Response status code: "));
+  SerialMon.println(status);
+  if (!status) {
+    vTaskDelay(5*1000/portTICK_RATE_MS);
+    return;
+  }
+
+  String body = http.responseBody();
+  String instruction= findHtmlInstructions(body);
+  SerialMon.println(F("Response:"));
+  SerialMon.println(instruction);
+
+}
+
+/// Util
 String findHtmlInstructions(const String& jsonString) {
   String target = "\"html_instructions\" : \"";
   int startIndex = jsonString.indexOf(target);
@@ -42,162 +153,94 @@ String findHtmlInstructions(const String& jsonString) {
   }
   return "";  // Return an empty string if not found
 }
+//Task1code: blinks an LED every 1000 ms
+void Task1code( void * pvParameters ){
+  Serial.print("Task1 running on core ");
+  Serial.println(xPortGetCoreID());
 
-void httpGETTask(void *pvParameters) {
-  while (1) {
-    if ((millis() - lastTime) > timerDelay) {
-      if (WiFi.status() == WL_CONNECTED) {
-        String apiResponse = httpGETRequest(serverName);
-        String htmlInstruction = findHtmlInstructions(apiResponse);
-        Serial.println(htmlInstruction);
-        String taskMessage = "HttpTask running on core ";
-    taskMessage = taskMessage + xPortGetCoreID();
-    Serial.println(taskMessage);
-      } else {
-        Serial.println("WiFi Disconnected");
-      }
-      lastTime = millis();
+  for(;;){
+    digitalWrite(led, HIGH);
+    delay(1000);
+    digitalWrite(led, LOW);
+    delay(1000);
+  } 
+}
+void GPSTask( void * pvParameters) {
+  while(1){
+    if(!modem.enableGPS()){
+      SerialMon.println("Enabling GPS/GNSS/GLONASS and waiting 15s for warm-up");
+      vTaskDelay(15*1000/portTICK_RATE_MS);
     }
-    vTaskDelay(pdMS_TO_TICKS(100)); // Adjust the delay as needed
+
+  float lat2      = 0;
+    float lon2      = 0;
+    float speed2    = 0;
+    float alt2      = 0;
+    int   vsat2     = 0;
+    int   usat2     = 0;
+    float accuracy2 = 0;
+    int   year2     = 0;
+    int   month2    = 0;
+    int   day2      = 0;
+    int   hour2     = 0;
+    int   min2      = 0;
+    int   sec2      = 0;
+    for (int8_t i = 15; i; i--) {
+      SerialMon.println("Requesting current GPS/GNSS/GLONASS location");
+      if (modem.getGPS(&OriginLatitude, &OriginLongitude, &speed2, &alt2, &vsat2, &usat2, &accuracy2,
+                      &year2, &month2, &day2, &hour2, &min2, &sec2)) {
+        SerialMon.print("Latitude:");
+        SerialMon.println(String(OriginLatitude, 8));
+        SerialMon.print("Longitude:");
+        SerialMon.println(String(OriginLongitude, 8));
+        // xTaskCreatePinnedToCore(
+        //             GetGmapsAPI,   /* Task function. */
+        //             "Get Gmaps Task",     /* name of task. */
+        //             10000,       /* Stack size of task */
+        //             NULL,        /* parameter of the task */
+        //             1,           /* priority of the task */
+        //             &GmapsGettask,      /* Task handle to keep track of created task */
+        //             1);
+        break;
+      } else {
+        SerialMon.println("Couldn't get GPS/GNSS/GLONASS location, retrying in 15s.");
+        vTaskDelay(15*1000/portTICK_RATE_MS);
+      }
+    }
+
+    vTaskDelay(5*1000/portTICK_RATE_MS);
+
   }
+ 
 }
-
-void gpsTask(void *pvParameters) {
-  // This sketch displays information every time a new sentence is correctly encoded.
-  while (Serial2.available() > 0)
-    if (gps.encode(Serial2.read()))
-      displayInfo();
-
-
-  // If 5000 milliseconds pass and there are no characters coming in
-  // over the software serial port, show a "No GPS detected" error
-  if (millis() > 5000 && gps.charsProcessed() < 10)
-  {
-    Serial.println("No GPS detected");
-    while(true);
-  }
-}
-
-void setup() {
-  Serial.begin(9600);
-    // Start the hardware serial port for GPS
-  Serial2.begin(GPSBaud, SERIAL_8N1, RXPin, TXPin);
-  WiFi.begin(ssid, password);
-  Serial.println("Connecting");
-  while(WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("");
-  Serial.print("Connected to WiFi network with IP Address: ");
-  Serial.println(WiFi.localIP());
-  Serial.println("Timer set to 5 seconds (timerDelay variable), it will take 5 seconds before publishing the first reading.");
-
-
-
-  // Create tasks
-  // xTaskCreatePinnedToCore(
-  //                   httpGETTask,   /* Function to implement the task */
-  //                   "httpGETTask", /* Name of the task */
-  //                   1024*30,      /* Stack size in words */
-  //                   NULL,       /* Task input parameter */
-  //                   0,          /* Priority of the task */
-  //                   &httpTaskHandle,       /* Task handle. */
-  //                   1);
-  // xTaskCreatePinnedToCore(
-  //                   gpsTask,   /* Function to implement the task */
-  //                   "GPSTask", /* Name of the task */
-  //                   10*1024,      /* Stack size in words */
-  //                   NULL,       /* Task input parameter */
-  //                   0,          /* Priority of the task */
-  //                   &gpsTaskHandle,       /* Task handle. */
-  //                   0);
-  xTaskCreate(httpGETTask, "HTTPTask", 10*1024, NULL, 1, &httpTaskHandle);
-  xTaskCreate(gpsTask, "GPSTask", 10*1024, NULL, 2, &gpsTaskHandle);
-}
-
-void loop() {
-  // The loop function is not used in this example.
-}
-String httpGETRequest(const char* serverName) {
-  WiFiClient client;
-  HTTPClient http;
-  // const String reqPayload= url + "origin=" + origin + "&destination=" + destination + "&mode=walking" + "&key=" + key;
-
-
-  http.begin(serverName);
-
-  int httpResponseCode = http.GET();
-
-  String payload = "{}";
-
-  if (httpResponseCode > 0) {
-    Serial.print("HTTP Response code: ");
-    // Serial.println(reqPayload);
-    payload = http.getString();
-  } else {
-    Serial.print("Error code: ");
-    Serial.println(httpResponseCode);
+void GetGmapsAPI (void * pvParameters){
+  if (!modem.gprsConnect(apn, gprsUser, gprsPass)) {
+    SerialMon.println("No Internet");
+    vTaskDelay(pdMS_TO_TICKS(10000));
+    return;
   }
 
-  http.end();
-
-  return payload;
-}
-void displayInfo()
-{
-      String taskMessage = "GPSTask running on core ";
-    taskMessage = taskMessage + xPortGetCoreID();
-    Serial.println(taskMessage);
-  if (gps.location.isValid())
-  {
-    Serial.print("Latitude: ");
-    Serial.println(gps.location.lat(), 6);
-    Serial.print("Longitude: ");
-    Serial.println(gps.location.lng(), 6);
-    Serial.print("Altitude: ");
-    Serial.println(gps.altitude.meters());
-  }
-  else
-  {
-    Serial.println("Location: Not Available");
-  }
-  
-  Serial.print("Date: ");
-  if (gps.date.isValid())
-  {
-    Serial.print(gps.date.month());
-    Serial.print("/");
-    Serial.print(gps.date.day());
-    Serial.print("/");
-    Serial.println(gps.date.year());
-  }
-  else
-  {
-    Serial.println("Not Available");
+  SerialMon.print(F("Performing HTTPS GET request... "));
+  http.connectionKeepAlive();  // Currently, this is needed for HTTPS
+  int err = http.get(createResourceString(OriginLatitude, OriginLongitude, DestinationLatitude, DestinationLongitude));
+  if (err != 0) {
+    SerialMon.println(F("failed to connect"));
+    SerialMon.println(err);
+    vTaskDelay(pdMS_TO_TICKS(10000));
+    return;
   }
 
-  Serial.print("Time: ");
-  if (gps.time.isValid())
-  {
-    if (gps.time.hour() < 10) Serial.print(F("0"));
-    Serial.print(gps.time.hour());
-    Serial.print(":");
-    if (gps.time.minute() < 10) Serial.print(F("0"));
-    Serial.print(gps.time.minute());
-    Serial.print(":");
-    if (gps.time.second() < 10) Serial.print(F("0"));
-    Serial.print(gps.time.second());
-    Serial.print(".");
-    if (gps.time.centisecond() < 10) Serial.print(F("0"));
-    Serial.println(gps.time.centisecond());
-  }
-  else
-  {
-    Serial.println("Not Available");
+  int status = http.responseStatusCode();
+  SerialMon.print(F("Response status code: "));
+  SerialMon.println(status);
+  if (!status) {
+    vTaskDelay(pdMS_TO_TICKS(10000));
+    return;
   }
 
-  Serial.println();
-  Serial.println();
-  delay(1000);
+  String body = http.responseBody();
+  String instruction= findHtmlInstructions(body);
+  SerialMon.println(F("Response:"));
+  SerialMon.println(instruction);
+
 }
